@@ -27,47 +27,65 @@ def time_of_flight(x0, z0, x1, z1, xc, zc, c, fnum, npts, Dmin=3e-3):
     # Calculate slowness map
     s = 1 / c
 
-    def interpolate(t):
-        xt = t * (x1 - x0) + x0  # True spatial location of path in x at t
-        zt = t * (z1 - z0) + z0  # True spatial location of path in z at t
+    def interpolate_slowness(t):
+        """Bilinearly interpolate the slowness map at a point along the ray path.
 
-        # Convert spatial locations into indices in xc and zc coordinates (in slowness map)
-        dxc, dzc = xc[1] - xc[0], zc[1] - zc[0]  # Assume a grid! Grid spacings
-        # Get indices of xt, zt in slowness map. Clamp at borders
+        Given parameter t in [0, 1], computes the spatial position along
+        the straight-line ray from (x0, z0) to (x1, z1), then samples the
+        slowness map using bilinear interpolation on the (xc, zc) grid.
+
+        @param t: Scalar in [0, 1], parameterizing the ray path
+        @return:  Slowness value at the interpolated position
+        """
+        xt = t * (x1 - x0) + x0  # Spatial position along ray in x
+        zt = t * (z1 - z0) + z0  # Spatial position along ray in z
+
+        # Convert spatial positions to fractional grid indices in (xc, zc)
+        dxc, dzc = xc[1] - xc[0], zc[1] - zc[0]
         xit = jnp.clip((xt - xc[0]) / dxc, 0, s.shape[0] - 1)
         zit = jnp.clip((zt - zc[0]) / dzc, 0, s.shape[1] - 1)
+
+        # Floor indices for the four surrounding grid points
         xi0 = jnp.floor(xit)
         zi0 = jnp.floor(zit)
         xi1 = xi0 + 1
         zi1 = zi0 + 1
-        # Interpolate slowness at (xt, zt)
+
+        # Sample slowness at the four surrounding grid points
         s00 = s[xi0.astype("int32"), zi0.astype("int32")]
         s10 = s[xi1.astype("int32"), zi0.astype("int32")]
         s01 = s[xi0.astype("int32"), zi1.astype("int32")]
         s11 = s[xi1.astype("int32"), zi1.astype("int32")]
+
+        # Bilinear weights based on distance to each corner
         w00 = (xi1 - xit) * (zi1 - zit)
         w10 = (xit - xi0) * (zi1 - zit)
         w01 = (xi1 - xit) * (zit - zi0)
         w11 = (xit - xi0) * (zit - zi0)
         return s00 * w00 + s10 * w10 + s01 * w01 + s11 * w11
 
-    # Compute the time-of-flight
+    # Compute the time-of-flight by integrating slowness along the ray path
     dx = jnp.abs(x1 - x0)
     dz = jnp.abs(z1 - z0)
-    dtrue = jnp.sqrt(dx**2 + dz**2)
-    slowness = vmap(interpolate)(t_all)  # bilinear interpolation
-    tof = jnp.nanmean(slowness, axis=0) * dtrue
-    # F-number mask for valid points
+    ray_length = jnp.sqrt(dx**2 + dz**2)
+    slowness = vmap(interpolate_slowness)(t_all)
+    tof = jnp.nanmean(slowness, axis=0) * ray_length
+
+    # F-number apodization mask: reject rays with too-steep angles.
+    # The f-number constraint limits the receive aperture angle:
+    #   |lateral_distance| / (2 * axial_distance) <= fnum
+    # Rearranged: |2 * fnum * dx| <= dz
     fnum_valid = jnp.abs(2 * fnum * dx) <= dz
-    # Additionally, set the minimum aperture width to be 3mm
-    Dmin_valid = jnp.logical_and(dz < Dmin * fnum, dx < Dmin / 2)
-    # Total mask for valid regions
-    valid = jnp.logical_or(fnum_valid, Dmin_valid)
-    # For invalid regions, assign dummy TOF that will be interpolated as 0 later
-    tof_valid = jnp.where(valid, tof, 1)
-    tof = jnp.where(
-        valid, tof_valid, -10 * jnp.ones_like(tof)
-    )
+
+    # Ensure a minimum aperture width (Dmin) regardless of f-number,
+    # so that near-field points still get enough element coverage.
+    # Active when axial depth is shallow (dz < Dmin * fnum) AND
+    # lateral offset is within half the minimum aperture (dx < Dmin / 2).
+    min_aperture_valid = jnp.logical_and(dz < Dmin * fnum, dx < Dmin / 2)
+
+    valid = jnp.logical_or(fnum_valid, min_aperture_valid)
+    # Invalid regions get a large negative TOF so they interpolate as zero
+    tof = jnp.where(valid, tof, -10 * jnp.ones_like(tof))
     return tof
 
 
