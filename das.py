@@ -1,10 +1,7 @@
-import jax.numpy as jnp
-from jax import jit, vmap, checkpoint
-from jax.lax import map
-from functools import partial
+import torch
+from torch.utils.checkpoint import checkpoint
 
 
-@partial(jit, static_argnums=(3, 4))
 def das(iqraw, tA, tB, fs, fd, A=None, B=None, apoA=1, apoB=1, interp="cubic"):
     """
     Delay-and-sum IQ data according to a given time delay profile.
@@ -32,9 +29,9 @@ def das(iqraw, tA, tB, fs, fd, A=None, B=None, apoA=1, apoB=1, interp="cubic"):
     """
     # The default linear combination is to sum all elements.
     if A is None:
-        A = jnp.ones((iqraw.shape[0],))
+        A = torch.ones((iqraw.shape[0],), dtype=iqraw.dtype, device=iqraw.device)
     if B is None:
-        B = jnp.ones((iqraw.shape[1],))
+        B = torch.ones((iqraw.shape[1],), dtype=iqraw.dtype, device=iqraw.device)
 
     # Choose the interpolating function
     fints = {
@@ -49,67 +46,67 @@ def das(iqraw, tA, tB, fs, fd, A=None, B=None, apoA=1, apoB=1, interp="cubic"):
     # Baseband interpolator
     def bbint(iq, t):
         iqfoc = fint(iq, fs * t)
-        return iqfoc * jnp.exp(2j * jnp.pi * fd * t)
+        return iqfoc * torch.exp(2j * torch.pi * fd * t)
 
-    # # Delay-and-sum beamforming (vmap inner, vmap outer)
-    # # This method uses vmap to push both the inner and outer loops into XLA, which uses
-    # # uses more memory, but can take advantage of XLA's parallelization.  However, it is
-    # # slower when memory bandwidth is a bottleneck.
-    # def das_b(iq_i, tA_i):
-    #     return jnp.tensordot(B, vmap(bbint)(iq_i, tA_i + tB) * apoB, (-1, 0))
-    # return jnp.tensordot(A, vmap(das_b)(iqraw, tA) * apoA, (-1, 0))
+    # Delay-and-sum beamforming (loop outer, vmap inner)
+    # This method does not vmap the outer loop and thus saves memory.
+    def das_b(iq_i, tA_i):
+        # vmap over the nb dimension (dim 0 of iq_i)
+        results = torch.vmap(bbint)(iq_i, tA_i + tB) * apoB
+        return torch.tensordot(B, results, dims=([-1], [0]))
 
-    # Delay-and-sum beamforming (vmap inner, map outer)
-    # This method does not vmap the outer loop and thus cannot take advantage of XLA's
-    # parallelization. However, it uses less memory and is faster when memory bandwidth
-    # is a bottleneck.
-    @checkpoint
-    def das_b(x):
-        iq_i, tA_i = x
-        return jnp.tensordot(B, vmap(bbint)(iq_i, tA_i + tB) * apoB, (-1, 0))
+    # Use checkpoint for memory efficiency (equivalent to jax.checkpoint)
+    results = []
+    for i in range(iqraw.shape[0]):
+        result = checkpoint(das_b, iqraw[i], tA[i], use_reentrant=False)
+        results.append(result)
+    mapped_results = torch.stack(results) * apoA
 
-    return jnp.tensordot(A, map(das_b, (iqraw, tA)) * apoA, (-1, 0))
+    return torch.tensordot(A, mapped_results, dims=([-1], [0]))
 
 
-def safe_access(x: jnp.ndarray, s):
+def safe_access(x, s):
     """Safe access to array x at indices s.
     @param x: Array to access
     @param s: Indices to access at
     @return: Array of values at indices s
     """
-    s = s.astype("int32")
-    valid = (s >= 0) & (s < x.size)
-    return jnp.where(valid, jnp.where(valid, x[s], 0), 0)
+    s = s.to(torch.int64)
+    valid = (s >= 0) & (s < x.numel())
+    safe_s = torch.clamp(s, 0, x.numel() - 1)
+    return torch.where(valid, x[safe_s], torch.zeros_like(x[safe_s]))
 
 
-def interp_nearest(x: jnp.ndarray, si: jnp.ndarray):
-    """1D nearest neighbor interpolation with jax.
+def interp_nearest(x, si):
+    """1D nearest neighbor interpolation with PyTorch.
     @param x: 1D array of values to interpolate
     @param si: Indices to interpolate at
     @return: Interpolated signal
     """
-    return x[jnp.clip(jnp.round(si), 0, x.shape[0] - 1).astype("int32")]
+    return x[torch.clamp(torch.round(si), 0, x.shape[0] - 1).to(torch.int64)]
 
 
-def interp_linear(x: jnp.ndarray, si: jnp.ndarray):
-    """1D linear interpolation with jax.
+def interp_linear(x, si):
+    """1D linear interpolation with PyTorch.
     @param x: 1D array of values to interpolate
     @param si: Indices to interpolate at
     @return: Interpolated signal
     """
-    f, s = jnp.modf(si)  # Extract fractional, integer parts
+    f = si - torch.floor(si)  # fractional part
+    s = torch.floor(si)       # integer part
     x0 = safe_access(x, s + 0)
     x1 = safe_access(x, s + 1)
     return (1 - f) * x0 + f * x1
 
 
-def interp_cubic(x: jnp.ndarray, si: jnp.ndarray):
-    """1D cubic Hermite interpolation with jax.
+def interp_cubic(x, si):
+    """1D cubic Hermite interpolation with PyTorch.
     @param x: 1D array of values to interpolate
     @param si: Indices to interpolate at
     @return: Interpolated signal
     """
-    f, s = jnp.modf(si)  # Extract fractional, integer parts
+    f = si - torch.floor(si)  # fractional part
+    s = torch.floor(si)       # integer part
     # Values
     x0 = safe_access(x, s - 1)
     x1 = safe_access(x, s + 0)
@@ -126,17 +123,19 @@ def interp_cubic(x: jnp.ndarray, si: jnp.ndarray):
 def _lanczos_helper(x, nlobe=3):
     """Lanczos kernel"""
     a = (nlobe + 1) / 2
-    return jnp.where(jnp.abs(x) < a, jnp.sinc(x) * jnp.sinc(x / a), 0)
+    return torch.where(torch.abs(x) < a, torch.sinc(x) * torch.sinc(x / a),
+                       torch.zeros_like(x))
 
 
-def interp_lanczos(x: jnp.ndarray, si: jnp.ndarray, nlobe=3):
-    """Lanczos interpolation with jax.
+def interp_lanczos(x, si, nlobe=3):
+    """Lanczos interpolation with PyTorch.
     @param x: 1D array of values to interpolate
     @param si: Indices to interpolate at
     @param nlobe: Number of lobes of the sinc function (e.g., 3 or 5)
     @return: Interpolated signal
     """
-    f, s = jnp.modf(si)  # Extract fractional, integer parts
+    f = si - torch.floor(si)  # fractional part
+    s = torch.floor(si)       # integer part
     x0 = safe_access(x, s - 1)
     x1 = safe_access(x, s + 0)
     x2 = safe_access(x, s + 1)
