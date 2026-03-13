@@ -1,15 +1,12 @@
 from pathlib import Path
 import numpy as np
-import jax.numpy as jnp
-from jax import jit
+import torch
 from das import das
 from paths import time_of_flight
 from hdf5storage import loadmat
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from matplotlib.animation import FFMpegWriter
-from jaxopt import OptaxSolver
-import optax
 from losses import (
     lag_one_coherence,
     coherence_factor,
@@ -142,24 +139,31 @@ def main(sample, loss_name):
                             \nOptions are {", ".join(CTRUE.keys()).lstrip(" ,")}.'
 
     # Get IQ data, time zeros, sampling and demodulation frequency, and element positions
-    iqdata, t0, fs, fd, elpos, _, _ = load_dataset(sample)
-    xe, _, ze = jnp.array(elpos)
-    wl0 = ASSUMED_C / fd  # wavelength (λ)
+    iqdata_np, t0_np, fs, fd, elpos, _, _ = load_dataset(sample)
+
+    # Convert to torch tensors
+    iqdata = torch.tensor(iqdata_np, dtype=torch.complex128)
+    t0 = torch.tensor(t0_np, dtype=torch.float64)
+    elpos_t = torch.tensor(elpos, dtype=torch.float64)
+    xe, _, ze = elpos_t
+    wl0 = ASSUMED_C / fd  # wavelength (lambda)
 
     # B-mode image dimensions
-    xi = jnp.arange(BMODE_X_MIN, BMODE_X_MAX, wl0 / 3)
-    zi = jnp.arange(BMODE_Z_MIN, BMODE_Z_MAX, wl0 / 3)
-    nxi, nzi = xi.size, zi.size
-    xi, zi = np.meshgrid(xi, zi, indexing="ij")
+    xi = torch.arange(BMODE_X_MIN, BMODE_X_MAX, wl0 / 3, dtype=torch.float64)
+    zi = torch.arange(BMODE_Z_MIN, BMODE_Z_MAX, wl0 / 3, dtype=torch.float64)
+    nxi, nzi = xi.size(0), zi.size(0)
+    xi_grid, zi_grid = np.meshgrid(xi.numpy(), zi.numpy(), indexing="ij")
+    xi = torch.tensor(xi_grid, dtype=torch.float64)
+    zi = torch.tensor(zi_grid, dtype=torch.float64)
 
     # Sound speed grid dimensions
-    xc = jnp.linspace(SOUND_SPEED_X_MIN, SOUND_SPEED_X_MAX, SOUND_SPEED_NXC)
-    zc = jnp.linspace(SOUND_SPEED_Z_MIN, SOUND_SPEED_Z_MAX, SOUND_SPEED_NZC)
+    xc = torch.linspace(SOUND_SPEED_X_MIN, SOUND_SPEED_X_MAX, SOUND_SPEED_NXC, dtype=torch.float64)
+    zc = torch.linspace(SOUND_SPEED_Z_MIN, SOUND_SPEED_Z_MAX, SOUND_SPEED_NZC, dtype=torch.float64)
     dxc, dzc = xc[1] - xc[0], zc[1] - zc[0]
 
-    # Kernels to use for loss calculations (2λ x 2λ patches)
-    xk, zk = np.meshgrid((jnp.arange(NXK) - (NXK - 1) / 2) * wl0 / 2,
-                         (jnp.arange(NZK) - (NZK - 1) / 2) * wl0 / 2,
+    # Kernels to use for loss calculations (2lambda x 2lambda patches)
+    xk, zk = np.meshgrid((torch.arange(NXK, dtype=torch.float64).numpy() - (NXK - 1) / 2) * wl0 / 2,
+                         (torch.arange(NZK, dtype=torch.float64).numpy() - (NZK - 1) / 2) * wl0 / 2,
                          indexing="ij")
 
     # Kernel patch centers, distributed throughout the field of view
@@ -169,10 +173,12 @@ def main(sample, loss_name):
         indexing="ij")
 
     # Explicit broadcasting. Dimensions will be [elements, pixels, patches]
-    xe = jnp.reshape(xe, (-1, 1, 1))
-    ze = jnp.reshape(ze, (-1, 1, 1))
-    xp = jnp.reshape(xpc, (1, -1, 1)) + jnp.reshape(xk, (1, 1, -1))
-    zp = jnp.reshape(zpc, (1, -1, 1)) + jnp.reshape(zk, (1, 1, -1))
+    xe = xe.reshape(-1, 1, 1)
+    ze = ze.reshape(-1, 1, 1)
+    xp = torch.tensor(xpc, dtype=torch.float64).reshape(1, -1, 1) + \
+         torch.tensor(xk, dtype=torch.float64).reshape(1, 1, -1)
+    zp = torch.tensor(zpc, dtype=torch.float64).reshape(1, -1, 1) + \
+         torch.tensor(zk, dtype=torch.float64).reshape(1, 1, -1)
     xp = xp + 0 * zp  # Manual broadcasting
     zp = zp + 0 * xp  # Manual broadcasting
 
@@ -185,26 +191,31 @@ def main(sample, loss_name):
 
     def makeImage(c):
         t = tof_image(c)
-        return jnp.abs(das(iqdata, t - t0, t, fs, fd))
+        return torch.abs(das(iqdata, t - t0, t, fs, fd))
 
     def loss_wrapper(func, c):
         t = tof_patch(c)
         return (func)(iqdata, t - t0, t, fs, fd)
 
     # Define loss functions
-    sb_loss = jit(lambda c: 1 - loss_wrapper(speckle_brightness, c))
-    lc_loss = jit(lambda c: 1 - jnp.mean(loss_wrapper(lag_one_coherence, c)))
-    cf_loss = jit(lambda c: 1 - jnp.mean(loss_wrapper(coherence_factor, c)))
+    def sb_loss(c):
+        return 1 - loss_wrapper(speckle_brightness, c)
 
-    @jit
+    def lc_loss(c):
+        return 1 - torch.mean(loss_wrapper(lag_one_coherence, c))
+
+    def cf_loss(c):
+        return 1 - torch.mean(loss_wrapper(coherence_factor, c))
+
     def pe_loss(c):
         t = tof_patch(c)
         dphi = phase_error(iqdata, t - t0, t, fs, fd)
         valid = dphi != 0
-        dphi = jnp.where(valid, jnp.where(valid, dphi, jnp.nan), jnp.nan)
-        return jnp.nanmean(jnp.log1p(jnp.square(100 * dphi)))
+        dphi = torch.where(valid, dphi, torch.tensor(float('nan'), dtype=dphi.dtype))
+        return torch.nanmean(torch.log1p(torch.square(100 * dphi)))
 
-    tv = jit(lambda c: total_variation(c) * dxc * dzc)
+    def tv(c):
+        return total_variation(c) * dxc * dzc
 
     def loss(c):
         if loss_name == "sb":  # Speckle brightness
@@ -216,31 +227,31 @@ def main(sample, loss_name):
         elif loss_name == "pe":  # Phase error
             return pe_loss(c) + tv(c) * 1e2
         else:
-            NotImplementedError
+            raise NotImplementedError
 
     # Initial survey of losses vs. global sound speed
-    c = ASSUMED_C * jnp.ones((SOUND_SPEED_NXC, SOUND_SPEED_NZC))
+    c = ASSUMED_C * torch.ones((SOUND_SPEED_NXC, SOUND_SPEED_NZC), dtype=torch.float64)
 
     # find optimal global sound speed for initalization
     c0 = np.linspace(1340, 1740, 201)
     dsb = np.array(
-        [sb_loss(cc * jnp.ones((SOUND_SPEED_NXC, SOUND_SPEED_NZC))) for cc in c0])
+        [sb_loss(cc * torch.ones((SOUND_SPEED_NXC, SOUND_SPEED_NZC), dtype=torch.float64)).item() for cc in c0])
     dlc = np.array(
-        [lc_loss(cc * jnp.ones((SOUND_SPEED_NXC, SOUND_SPEED_NZC))) for cc in c0])
+        [lc_loss(cc * torch.ones((SOUND_SPEED_NXC, SOUND_SPEED_NZC), dtype=torch.float64)).item() for cc in c0])
     dcf = np.array(
-        [cf_loss(cc * jnp.ones((SOUND_SPEED_NXC, SOUND_SPEED_NZC))) for cc in c0])
+        [cf_loss(cc * torch.ones((SOUND_SPEED_NXC, SOUND_SPEED_NZC), dtype=torch.float64)).item() for cc in c0])
     dpe = np.array(
-        [pe_loss(cc * jnp.ones((SOUND_SPEED_NXC, SOUND_SPEED_NZC))) for cc in c0])
+        [pe_loss(cc * torch.ones((SOUND_SPEED_NXC, SOUND_SPEED_NZC), dtype=torch.float64)).item() for cc in c0])
     # Use the sound speed with the optimal phase error to initialize sound speed map
-    c = c0[np.argmin(dpe)] * jnp.ones((SOUND_SPEED_NXC, SOUND_SPEED_NZC))
+    c = torch.nn.Parameter(
+        c0[np.argmin(dpe)] * torch.ones((SOUND_SPEED_NXC, SOUND_SPEED_NZC), dtype=torch.float64)
+    )
 
     # Plot global sound speed error
     plot_errors_vs_sound_speeds(c0, dsb, dlc, dcf, dpe, sample)
 
-    # Create the optimizer
-    opt = OptaxSolver(opt=optax.amsgrad(LEARNING_RATE),
-                      fun=loss)  # Stochastic optimizer
-    state = opt.init_state(c)
+    # Create the optimizer (AMSGrad variant of Adam, equivalent to optax.amsgrad)
+    optimizer = torch.optim.Adam([c], lr=LEARNING_RATE, amsgrad=True)
 
     # Create the figure writer
     fig, _ = plt.subplots(1, 2, figsize=[9, 4])
@@ -248,10 +259,10 @@ def main(sample, loss_name):
     vobj.setup(fig, "videos/%s_opt%s.mp4" % (sample, loss_name), dpi=144)
 
     # Create the image axes for plotting
-    ximm = xi[:, 0] * 1e3
-    zimm = zi[0, :] * 1e3
-    xcmm = xc * 1e3
-    zcmm = zc * 1e3
+    ximm = xi[:, 0].numpy() * 1e3
+    zimm = zi[0, :].numpy() * 1e3
+    xcmm = xc.numpy() * 1e3
+    zcmm = zc.numpy() * 1e3
     bdr = [-45, +5]
     cdr = np.array([-50, +50]) + \
         CTRUE[sample] if CTRUE[sample] > 0 else [1400, 1600]
@@ -259,48 +270,51 @@ def main(sample, loss_name):
 
     # Create a nice figure on first call, update on subsequent calls
     def makeFigure(cimg, i, handles=None):
-        b = makeImage(cimg)
+        with torch.no_grad():
+            c_detached = cimg.detach()
+            b = makeImage(c_detached)
         if handles is None:
-            bmax = np.max(b)
+            bmax = b.max().item()
         else:
             hbi, hci, hbt, hct, bmax = handles
         bimg = b / bmax
         bimg = bimg + 1e-10 * (bimg == 0)  # Avoid nans
-        bimg = 20 * np.log10(bimg)
-        bimg = np.reshape(bimg, (nxi, nzi)).T
-        cimg = np.reshape(cimg, (SOUND_SPEED_NXC, SOUND_SPEED_NZC)).T
+        bimg = 20 * torch.log10(bimg)
+        bimg = bimg.reshape(nxi, nzi).T.numpy()
+        cimg_np = c_detached.reshape(SOUND_SPEED_NXC, SOUND_SPEED_NZC).T.numpy()
 
         if handles is None:
-            # On the first call, report the fps of jax
+            # On the first call, report the fps
             tic = time.perf_counter_ns()
-            for _ in range(30):
-                b = makeImage(cimg)
-            b.block_until_ready()
+            with torch.no_grad():
+                for _ in range(30):
+                    b = makeImage(c_detached)
             toc = time.perf_counter_ns()
-            print("jaxbf runs at %.1f fps." % (100.0 / ((toc - tic) * 1e-9)))
+            print("pytorch bf runs at %.1f fps." % (100.0 / ((toc - tic) * 1e-9)))
 
             # On the first time, create the figure
             fig.clf()
             plt.subplot(121)
             hbi = imagesc(ximm, zimm, bimg, bdr, cmap="bone",
                           interpolation="bicubic")
-            hbt = plt.title(
-                "SB: %.2f, CF: %.3f, PE: %.3f" % (
-                    sb_loss(c), cf_loss(c), pe_loss(c))
-            )
+            with torch.no_grad():
+                hbt = plt.title(
+                    "SB: %.2f, CF: %.3f, PE: %.3f" % (
+                        sb_loss(c_detached).item(), cf_loss(c_detached).item(), pe_loss(c_detached).item())
+                )
             plt.xlim(ximm[0], ximm[-1])
             plt.ylim(zimm[-1], zimm[0])
             plt.subplot(122)
-            hci = imagesc(xcmm, zcmm, cimg, cdr, cmap=cmap,
+            hci = imagesc(xcmm, zcmm, cimg_np, cdr, cmap=cmap,
                           interpolation="bicubic")
             if CTRUE[sample] > 0:  # When ground truth is provided, show the error
                 hct = plt.title(
                     "Iteration %d: MAE %.2f"
-                    % (i, np.mean(np.abs(cimg - CTRUE[sample])))
+                    % (i, np.mean(np.abs(cimg_np - CTRUE[sample])))
                 )
             else:
                 hct = plt.title("Iteration %d: Mean value %.2f" %
-                                (i, np.mean(cimg)))
+                                (i, np.mean(cimg_np)))
 
             plt.xlim(ximm[0], ximm[-1])
             plt.ylim(zimm[-1], zimm[0])
@@ -308,19 +322,20 @@ def main(sample, loss_name):
             return hbi, hci, hbt, hct, bmax
         else:
             hbi.set_data(bimg)
-            hci.set_data(cimg)
-            hbt.set_text(
-                "SB: %.2f, CF: %.3f, PE: %.3f" % (
-                    sb_loss(c), cf_loss(c), pe_loss(c))
-            )
+            hci.set_data(cimg_np)
+            with torch.no_grad():
+                hbt.set_text(
+                    "SB: %.2f, CF: %.3f, PE: %.3f" % (
+                        sb_loss(c_detached).item(), cf_loss(c_detached).item(), pe_loss(c_detached).item())
+                )
             if CTRUE[sample] > 0:
                 hct.set_text(
                     "Iteration %d: MAE %.2f"
-                    % (i, np.mean(np.abs(cimg - CTRUE[sample])))
+                    % (i, np.mean(np.abs(cimg_np - CTRUE[sample])))
                 )
             else:
                 hct.set_text("Iteration %d: Mean value %.2f" %
-                             (i, np.mean(cimg)))
+                             (i, np.mean(cimg_np)))
 
         plt.savefig(f"scratch/{sample}.png")
 
@@ -329,12 +344,15 @@ def main(sample, loss_name):
 
     # Optimization loop
     for i in tqdm(range(N_ITERS)):
-        c, state = opt.update(c, state)
+        optimizer.zero_grad()
+        l = loss(c)
+        l.backward()
+        optimizer.step()
         makeFigure(c, i + 1, handles)  # Update figure
         vobj.grab_frame()  # Add to video writer
     vobj.finish()  # Close video writer
 
-    return c
+    return c.detach()
 
 
 if __name__ == "__main__":
@@ -344,4 +362,3 @@ if __name__ == "__main__":
     # for sample in CTRUE.keys():
     #     print(sample)
     #     main(sample, LOSS)
-
