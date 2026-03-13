@@ -1,10 +1,7 @@
-from jax import vmap, jit
-import jax.numpy as jnp
+import torch
 import numpy as np
-from functools import partial
 
 
-@partial(jit, static_argnums=(7, 8, 9))
 def time_of_flight(x0, z0, x1, z1, xc, zc, c, fnum, npts, Dmin=3e-3):
     """
     Get the time-of-flight from (x0,z0) to (x1,z1) according to the
@@ -22,7 +19,7 @@ def time_of_flight(x0, z0, x1, z1, xc, zc, c, fnum, npts, Dmin=3e-3):
     """
     # Find the path along the path curve, modeled as a straight ray
     # parameterized by t. We will put t in the innermost dimension.
-    t_all = jnp.linspace(1, 0, npts, endpoint=False)[::-1]
+    t_all = torch.linspace(1, 0, npts).flip(0)
 
     # Calculate slowness map
     s = 1 / c
@@ -34,17 +31,17 @@ def time_of_flight(x0, z0, x1, z1, xc, zc, c, fnum, npts, Dmin=3e-3):
         # Convert spatial locations into indices in xc and zc coordinates (in slowness map)
         dxc, dzc = xc[1] - xc[0], zc[1] - zc[0]  # Assume a grid! Grid spacings
         # Get indices of xt, zt in slowness map. Clamp at borders
-        xit = jnp.clip((xt - xc[0]) / dxc, 0, s.shape[0] - 1)
-        zit = jnp.clip((zt - zc[0]) / dzc, 0, s.shape[1] - 1)
-        xi0 = jnp.floor(xit)
-        zi0 = jnp.floor(zit)
+        xit = torch.clamp((xt - xc[0]) / dxc, 0, s.shape[0] - 1)
+        zit = torch.clamp((zt - zc[0]) / dzc, 0, s.shape[1] - 1)
+        xi0 = torch.floor(xit)
+        zi0 = torch.floor(zit)
         xi1 = xi0 + 1
         zi1 = zi0 + 1
         # Interpolate slowness at (xt, zt)
-        s00 = s[xi0.astype("int32"), zi0.astype("int32")]
-        s10 = s[xi1.astype("int32"), zi0.astype("int32")]
-        s01 = s[xi0.astype("int32"), zi1.astype("int32")]
-        s11 = s[xi1.astype("int32"), zi1.astype("int32")]
+        s00 = s[xi0.to(torch.int64), zi0.to(torch.int64)]
+        s10 = s[xi1.to(torch.int64).clamp(max=s.shape[0] - 1), zi0.to(torch.int64)]
+        s01 = s[xi0.to(torch.int64), zi1.to(torch.int64).clamp(max=s.shape[1] - 1)]
+        s11 = s[xi1.to(torch.int64).clamp(max=s.shape[0] - 1), zi1.to(torch.int64).clamp(max=s.shape[1] - 1)]
         w00 = (xi1 - xit) * (zi1 - zit)
         w10 = (xit - xi0) * (zi1 - zit)
         w01 = (xi1 - xit) * (zit - zi0)
@@ -52,22 +49,21 @@ def time_of_flight(x0, z0, x1, z1, xc, zc, c, fnum, npts, Dmin=3e-3):
         return s00 * w00 + s10 * w10 + s01 * w01 + s11 * w11
 
     # Compute the time-of-flight
-    dx = jnp.abs(x1 - x0)
-    dz = jnp.abs(z1 - z0)
-    dtrue = jnp.sqrt(dx**2 + dz**2)
-    slowness = vmap(interpolate)(t_all)  # bilinear interpolation
-    tof = jnp.nanmean(slowness, axis=0) * dtrue
+    dx = torch.abs(x1 - x0)
+    dz = torch.abs(z1 - z0)
+    dtrue = torch.sqrt(dx**2 + dz**2)
+    # vmap over t_all (equivalent to jax vmap(interpolate)(t_all))
+    slowness = torch.stack([interpolate(t) for t in t_all])
+    tof = torch.nanmean(slowness, dim=0) * dtrue
     # F-number mask for valid points
-    fnum_valid = jnp.abs(2 * fnum * dx) <= dz
+    fnum_valid = torch.abs(2 * fnum * dx) <= dz
     # Additionally, set the minimum aperture width to be 3mm
-    Dmin_valid = jnp.logical_and(dz < Dmin * fnum, dx < Dmin / 2)
+    Dmin_valid = (dz < Dmin * fnum) & (dx < Dmin / 2)
     # Total mask for valid regions
-    valid = jnp.logical_or(fnum_valid, Dmin_valid)
+    valid = fnum_valid | Dmin_valid
     # For invalid regions, assign dummy TOF that will be interpolated as 0 later
-    tof_valid = jnp.where(valid, tof, 1)
-    tof = jnp.where(
-        valid, tof_valid, -10 * jnp.ones_like(tof)
+    tof_valid = torch.where(valid, tof, torch.ones_like(tof))
+    tof = torch.where(
+        valid, tof_valid, -10 * torch.ones_like(tof)
     )
     return tof
-
-
