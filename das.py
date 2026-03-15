@@ -72,14 +72,14 @@ def das(iqraw, tA, tB, fs, fd, A=None, B=None, apoA=1, apoB=1, interp="cubic"):
 
 
 def safe_access(x: jnp.ndarray, s):
-    """Safe access to array x at indices s, returning 0 for out-of-bounds.
+    """Safe access to array x at indices s.
     @param x: Array to access
     @param s: Indices to access at
-    @return: Array of values at indices s, with 0 for out-of-bounds
+    @return: Array of values at indices s
     """
     s = s.astype("int32")
     valid = (s >= 0) & (s < x.size)
-    return jnp.where(valid, x[jnp.clip(s, 0, x.size - 1)], 0)
+    return jnp.where(valid, jnp.where(valid, x[s], 0), 0)
 
 
 def interp_nearest(x: jnp.ndarray, si: jnp.ndarray):
@@ -103,28 +103,19 @@ def interp_linear(x: jnp.ndarray, si: jnp.ndarray):
     return (1 - f) * x0 + f * x1
 
 
-def _extract_interpolation_samples(x: jnp.ndarray, si: jnp.ndarray):
-    """Extract 4 neighboring samples and fractional offset for interpolation.
-    @param x:  1D array of values to interpolate
-    @param si: Continuous indices to interpolate at
-    @return: (fractional_part, sample_at_s_minus_1, sample_at_s, sample_at_s_plus_1, sample_at_s_plus_2)
-    """
-    frac, integer_part = jnp.modf(si)
-    s_m1 = safe_access(x, integer_part - 1)
-    s_0 = safe_access(x, integer_part + 0)
-    s_p1 = safe_access(x, integer_part + 1)
-    s_p2 = safe_access(x, integer_part + 2)
-    return frac, s_m1, s_0, s_p1, s_p2
-
-
 def interp_cubic(x: jnp.ndarray, si: jnp.ndarray):
     """1D cubic Hermite interpolation with jax.
     @param x: 1D array of values to interpolate
     @param si: Indices to interpolate at
     @return: Interpolated signal
     """
-    f, x0, x1, x2, x3 = _extract_interpolation_samples(x, si)
-    # Cubic Hermite coefficients
+    f, s = jnp.modf(si)  # Extract fractional, integer parts
+    # Values
+    x0 = safe_access(x, s - 1)
+    x1 = safe_access(x, s + 0)
+    x2 = safe_access(x, s + 1)
+    x3 = safe_access(x, s + 2)
+    # Coefficients
     a0 = 0 + f * (-1 + f * (+2 * f - 1))
     a1 = 2 + f * (+0 + f * (-5 * f + 3))
     a2 = 0 + f * (+1 + f * (+4 * f - 3))
@@ -132,14 +123,10 @@ def interp_cubic(x: jnp.ndarray, si: jnp.ndarray):
     return (a0 * x0 + a1 * x1 + a2 * x2 + a3 * x3) / 2
 
 
-def _lanczos_kernel(x, nlobe=3):
-    """Lanczos kernel: windowed sinc function.
-    @param x:     Evaluation points
-    @param nlobe: Number of lobes of the sinc function
-    @return: Kernel values at x
-    """
-    half_width = (nlobe + 1) / 2
-    return jnp.where(jnp.abs(x) < half_width, jnp.sinc(x) * jnp.sinc(x / half_width), 0)
+def _lanczos_helper(x, nlobe=3):
+    """Lanczos kernel"""
+    a = (nlobe + 1) / 2
+    return jnp.where(jnp.abs(x) < a, jnp.sinc(x) * jnp.sinc(x / a), 0)
 
 
 def interp_lanczos(x: jnp.ndarray, si: jnp.ndarray, nlobe=3):
@@ -149,9 +136,13 @@ def interp_lanczos(x: jnp.ndarray, si: jnp.ndarray, nlobe=3):
     @param nlobe: Number of lobes of the sinc function (e.g., 3 or 5)
     @return: Interpolated signal
     """
-    f, x0, x1, x2, x3 = _extract_interpolation_samples(x, si)
-    a0 = _lanczos_kernel(f + 1, nlobe)
-    a1 = _lanczos_kernel(f + 0, nlobe)
-    a2 = _lanczos_kernel(f - 1, nlobe)
-    a3 = _lanczos_kernel(f - 2, nlobe)
+    f, s = jnp.modf(si)  # Extract fractional, integer parts
+    x0 = safe_access(x, s - 1)
+    x1 = safe_access(x, s + 0)
+    x2 = safe_access(x, s + 1)
+    x3 = safe_access(x, s + 2)
+    a0 = _lanczos_helper(f + 1, nlobe)
+    a1 = _lanczos_helper(f + 0, nlobe)
+    a2 = _lanczos_helper(f - 1, nlobe)
+    a3 = _lanczos_helper(f - 2, nlobe)
     return a0 * x0 + a1 * x1 + a2 * x2 + a3 * x3
